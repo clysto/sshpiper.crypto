@@ -5,9 +5,12 @@
 package ssh
 
 import (
+	"bytes"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -222,6 +225,212 @@ func TestNewServerConnValidationErrors(t *testing.T) {
 	}
 	if c.isUsed() {
 		t.Fatal("NewServerConn with unsupported key exchange used connection")
+	}
+}
+
+func TestBannerError(t *testing.T) {
+	serverConfig := &ServerConfig{
+		BannerCallback: func(ConnMetadata) string {
+			return "banner from BannerCallback"
+		},
+		NoClientAuth: true,
+		NoClientAuthCallback: func(ConnMetadata) (*Permissions, error) {
+			err := &BannerError{
+				Err:     errors.New("error from NoClientAuthCallback"),
+				Message: "banner from NoClientAuthCallback",
+			}
+			return nil, fmt.Errorf("wrapped: %w", err)
+		},
+		PasswordCallback: func(conn ConnMetadata, password []byte) (*Permissions, error) {
+			return &Permissions{}, nil
+		},
+		PublicKeyCallback: func(conn ConnMetadata, key PublicKey) (*Permissions, error) {
+			return nil, &BannerError{
+				Err:     errors.New("error from PublicKeyCallback"),
+				Message: "banner from PublicKeyCallback",
+			}
+		},
+		KeyboardInteractiveCallback: func(conn ConnMetadata, client KeyboardInteractiveChallenge) (*Permissions, error) {
+			return nil, &BannerError{
+				Err:     nil, // make sure that a nil inner error is allowed
+				Message: "banner from KeyboardInteractiveCallback",
+			}
+		},
+	}
+	serverConfig.AddHostKey(testSigners["rsa"])
+
+	var banners []string
+	clientConfig := &ClientConfig{
+		User: "test",
+		Auth: []AuthMethod{
+			PublicKeys(testSigners["rsa"]),
+			KeyboardInteractive(func(name, instruction string, questions []string, echos []bool) ([]string, error) {
+				return []string{"letmein"}, nil
+			}),
+			Password(clientPassword),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+		BannerCallback: func(msg string) error {
+			banners = append(banners, msg)
+			return nil
+		},
+	}
+
+	c1, c2, err := netPipe()
+	if err != nil {
+		t.Fatalf("netPipe: %v", err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+	go newServer(c1, serverConfig)
+	c, _, _, err := NewClientConn(c2, "", clientConfig)
+	if err != nil {
+		t.Fatalf("client connection failed: %v", err)
+	}
+	defer c.Close()
+
+	wantBanners := []string{
+		"banner from BannerCallback",
+		"banner from NoClientAuthCallback",
+		"banner from PublicKeyCallback",
+		"banner from KeyboardInteractiveCallback",
+	}
+	if !reflect.DeepEqual(banners, wantBanners) {
+		t.Errorf("got banners:\n%q\nwant banners:\n%q", banners, wantBanners)
+	}
+}
+
+func TestPublicKeyCallbackLastSeen(t *testing.T) {
+	var lastSeenKey PublicKey
+
+	c1, c2, err := netPipe()
+	if err != nil {
+		t.Fatalf("netPipe: %v", err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+	serverConf := &ServerConfig{
+		PublicKeyCallback: func(conn ConnMetadata, key PublicKey) (*Permissions, error) {
+			lastSeenKey = key
+			fmt.Printf("seen %#v\n", key)
+			if _, ok := key.(*dsaPublicKey); !ok {
+				return nil, errors.New("nope")
+			}
+			return nil, nil
+		},
+	}
+	serverConf.AddHostKey(testSigners["ecdsap256"])
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		NewServerConn(c1, serverConf)
+	}()
+
+	clientConf := ClientConfig{
+		User: "user",
+		Auth: []AuthMethod{
+			PublicKeys(testSigners["rsa"], testSigners["dsa"], testSigners["ed25519"]),
+		},
+		HostKeyCallback: InsecureIgnoreHostKey(),
+	}
+
+	_, _, _, err = NewClientConn(c2, "", &clientConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	<-done
+
+	expectedPublicKey := testSigners["dsa"].PublicKey().Marshal()
+	lastSeenMarshalled := lastSeenKey.Marshal()
+	if !bytes.Equal(lastSeenMarshalled, expectedPublicKey) {
+		t.Errorf("unexpected key: got %#v, want %#v", lastSeenKey, testSigners["dsa"].PublicKey())
+	}
+}
+
+func TestPreAuthConnAndBanners(t *testing.T) {
+	testDone := make(chan struct{})
+	defer close(testDone)
+
+	authConnc := make(chan ServerPreAuthConn, 1)
+	serverConfig := &ServerConfig{
+		PreAuthConnCallback: func(c ServerPreAuthConn) {
+			t.Logf("got ServerPreAuthConn: %v", c)
+			authConnc <- c // for use later in the test
+			for _, s := range []string{"hello1", "hello2"} {
+				if err := c.SendAuthBanner(s); err != nil {
+					t.Errorf("failed to send banner %q: %v", s, err)
+				}
+			}
+			// Now start a goroutine to spam SendAuthBanner in hopes
+			// of hitting a race.
+			go func() {
+				for {
+					select {
+					case <-testDone:
+						return
+					default:
+						if err := c.SendAuthBanner("attempted-race"); err != nil && err != errSendBannerPhase {
+							t.Errorf("unexpected error from SendAuthBanner: %v", err)
+						}
+						time.Sleep(5 * time.Millisecond)
+					}
+				}
+			}()
+		},
+		NoClientAuth: true,
+		NoClientAuthCallback: func(ConnMetadata) (*Permissions, error) {
+			t.Logf("got NoClientAuthCallback")
+			return &Permissions{}, nil
+		},
+	}
+	serverConfig.AddHostKey(testSigners["rsa"])
+
+	var banners []string
+	clientConfig := &ClientConfig{
+		User:            "test",
+		HostKeyCallback: InsecureIgnoreHostKey(),
+		BannerCallback: func(msg string) error {
+			if msg != "attempted-race" {
+				banners = append(banners, msg)
+			}
+			return nil
+		},
+	}
+
+	c1, c2, err := netPipe()
+	if err != nil {
+		t.Fatalf("netPipe: %v", err)
+	}
+	defer c1.Close()
+	defer c2.Close()
+	go newServer(c1, serverConfig)
+	c, _, _, err := NewClientConn(c2, "", clientConfig)
+	if err != nil {
+		t.Fatalf("client connection failed: %v", err)
+	}
+	defer c.Close()
+
+	wantBanners := []string{
+		"hello1",
+		"hello2",
+	}
+	if !reflect.DeepEqual(banners, wantBanners) {
+		t.Errorf("got banners:\n%q\nwant banners:\n%q", banners, wantBanners)
+	}
+
+	// Now that we're authenticated, verify that use of SendBanner
+	// is an error.
+	var bc ServerPreAuthConn
+	select {
+	case bc = <-authConnc:
+	default:
+		t.Fatal("expected ServerPreAuthConn")
+	}
+	if err := bc.SendAuthBanner("wrong-phase"); err == nil {
+		t.Error("unexpected success of SendAuthBanner after authentication")
+	} else if err != errSendBannerPhase {
+		t.Errorf("unexpected error: %v; want %v", err, errSendBannerPhase)
 	}
 }
 
