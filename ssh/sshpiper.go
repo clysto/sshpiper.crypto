@@ -62,6 +62,12 @@ type PiperConfig struct {
 	// UpstreamAuthFailureCallback, if non-nil, that is called when the upstream authentication fails.
 	UpstreamAuthFailureCallback func(conn ConnMetadata, method string, err error, challengeCtx ChallengeContext)
 
+	// PreAuthConnCallback, if non-nil, is called upon receiving a new connection
+	// before any authentication has started. The provided ServerPreAuthConn
+	// can be used at any time before authentication is complete, including
+	// after this callback has returned.
+	PreAuthConnCallback func(preAuthConn ServerPreAuthConn, challengeCtx ChallengeContext)
+
 	// ServerVersion is the version identification string to announce in the public handshake.
 	// If empty, a reasonable default is used.
 	// Note that RFC 4253 section 4.2 requires that this string start with "SSH-2.0-".
@@ -194,7 +200,7 @@ func (p *PiperConn) authUpstream(downstream ConnMetadata, method string, upstrea
 		if p.config.UpstreamAuthFailureCallback != nil {
 			p.config.UpstreamAuthFailureCallback(downstream, method, err, p.challengeCtx)
 		}
-		
+
 		return p.updateAuthMethods(err)
 	}
 
@@ -242,6 +248,10 @@ func (p *PiperConn) keyboardInteractiveCallback(conn ConnMetadata, client Keyboa
 
 func (p *PiperConn) bannerCallback(conn ConnMetadata) string {
 	return p.config.BannerCallback(conn, p.challengeCtx)
+}
+
+func (p *PiperConn) preAuthConnCallback(preAuthConn ServerPreAuthConn) {
+	p.config.PreAuthConnCallback(preAuthConn, p.challengeCtx)
 }
 
 func (p *PiperConn) updateAuthMethods(emptyerr error) error {
@@ -327,6 +337,10 @@ func NewSSHPiperConn(conn net.Conn, config *PiperConfig) (*PiperConn, error) {
 
 	if config.BannerCallback != nil {
 		p.authOnlyConfig.BannerCallback = p.bannerCallback
+	}
+
+	if config.PreAuthConnCallback != nil {
+		p.authOnlyConfig.PreAuthConnCallback = p.preAuthConnCallback
 	}
 
 	if err := p.mapToUpstreamViaDownstreamAuth(); err != nil {
